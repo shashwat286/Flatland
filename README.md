@@ -36,6 +36,10 @@ run the script again, it picks up from the latest checkpoint automatically.
 The number of parallel environments is based on your CPU core count, up to 11. If your machine still slows down,
 lower `N_WORKERS` at the top of `Training.py`.
 
+Flatland only gives a reward at the end of an episode, so each train also gets a small bonus for every cell it moves
+closer to its target (and a penalty for moving away). You can change this with `SHAPING_COEF` in `Training.py`,
+or set it to `0.0` to turn it off. The `EpReward` in the logs is always Flatland's own reward, so runs stay comparable.
+
 ## Running on Colab
 
 Run `python build_colab.py` to create `Flatland_Colab_Ready.ipynb`. Upload it to Colab and pick a GPU runtime.
