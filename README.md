@@ -14,19 +14,15 @@ The main pieces:
 
 ## How to run
 
-Install the dependencies (Python 3.10 or newer):
+Install the dependencies (Python 3.9 or newer):
 
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
-pip install flatland-rl torch numpy
+pip install flatland-rl==4.0.3 torch numpy
 ```
 
-Before you start, open `config.py` and point `checkpoint_dir` to a local folder. The default is a Google Drive path for Colab:
-
-```python
-checkpoint_dir = "./checkpoints"
-```
+The code is written against the Flatland 4.x API, so other versions may break it.
 
 Then start training:
 
@@ -34,10 +30,11 @@ Then start training:
 python Training.py
 ```
 
-Progress prints to the terminal. Checkpoints are saved every 50 episodes. If you stop and run the script again,
-it picks up from the latest checkpoint automatically.
+Progress prints to the terminal. Checkpoints are saved to the `checkpoints/` folder every 50 episodes. If you stop and
+run the script again, it picks up from the latest checkpoint automatically.
 
-If your machine slows to a crawl, lower `N_WORKERS` at the top of `Training.py`. It's set to 11, which suits a 12-core machine.
+The number of parallel environments is based on your CPU core count, up to 11. If your machine still slows down,
+lower `N_WORKERS` at the top of `Training.py`.
 
 ## Running on Colab
 

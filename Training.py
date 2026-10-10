@@ -44,13 +44,14 @@ from config import Config
 from NewAgentInitObs import StateMaskingObs
 from agents.models import ACNet
 from shortestpath import clear_trans_cache   # clear shared transition cache on env reset
+from flatland.envs.step_utils.states import TrainState
 
 
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 
-N_WORKERS    = 11       # 12 Colab L4 cores - 1 for main process
+N_WORKERS    = max(1, min(11, (os.cpu_count() or 2) - 1))   # 11 on a 12-core Colab L4; fewer on smaller machines
 ROLLOUT_LEN  = 128      # steps collected per worker before PPO update
 PPO_EPOCHS   = 4
 PPO_CLIP     = 0.2
@@ -61,6 +62,13 @@ MAX_EPISODES = 11000
 SAVE_EVERY   = 50
 A_SIZE       = 4        # internal: 0=Left, 1=Forward, 2=Right, 3=Stop
 
+# Reward shaping: Flatland 4.x only gives reward at episode end, so the agents
+# get almost no feedback during 1500-step episodes. Each step, every agent
+# additionally receives SHAPING_COEF × (cells it moved closer to its target).
+# Moving away is penalised by the same amount; waiting / malfunctions give 0.
+# Set to 0.0 to train on Flatland's raw reward only.
+SHAPING_COEF = 0.1
+
 _SHUTDOWN = "SHUTDOWN"
 _RESET    = "RESET"
 
@@ -69,12 +77,14 @@ _RESET    = "RESET"
 # Environment factory  (called inside worker processes only)
 # ---------------------------------------------------------------------------
 
-def make_env(seed_offset: int = 0) -> RailEnv:
+def make_env(rank: int = 0) -> RailEnv:
+    # seed=None: the generator then uses the env's RNG, which we re-seed on every
+    # reset(random_seed=...). A fixed seed here would rebuild the SAME map every episode.
     rail_gen = sparse_rail_generator(
         max_num_cities=Config.n_cities,
         max_rails_between_cities=Config.max_rails_between_cities,
         max_rail_pairs_in_city=Config.max_rail_pairs_in_city,
-        seed=Config.seed + seed_offset,
+        seed=None,
         grid_mode=False,
     )
     malfunction_gen = ParamMalfunctionGen(MalfunctionParameters(
@@ -86,7 +96,10 @@ def make_env(seed_offset: int = 0) -> RailEnv:
         width=Config.width,
         height=Config.height,
         rail_generator=rail_gen,
-        line_generator=SparseLineGen(seed=None),
+        # SparseLineGen needs an int seed (flatland 4.x computes seed + num_resets,
+        # so seed=None crashes). It already changes every reset; rank keeps
+        # workers distinct.
+        line_generator=SparseLineGen(seed=Config.seed + 100_000 * rank),
         number_of_agents=Config.n_agents,
         obs_builder_object=StateMaskingObs(),
         malfunction_generator=malfunction_gen,
@@ -108,7 +121,7 @@ def state_classifier(env, pos, direction, _cache=None):
     if _cache is not None and key in _cache:
         avb_moves = _cache[key]
     else:
-        avb_moves = env.rail.get_transitions((pos, direction))
+        avb_moves = env.rail.get_transitions(*pos, direction)
         if _cache is not None:
             _cache[key] = avb_moves
     if sum(avb_moves) > 1:
@@ -123,7 +136,7 @@ def state_classifier(env, pos, direction, _cache=None):
         if _cache is not None and nkey in _cache:
             trans = _cache[nkey]
         else:
-            trans = env.rail.get_transitions((next_pos, d))
+            trans = env.rail.get_transitions(*next_pos, d)
             if _cache is not None:
                 _cache[nkey] = trans
         if sum(trans) > 2:
@@ -187,6 +200,20 @@ def get_valid_actions(env, obs, agent_id, _cache=None):
 
 
 # ---------------------------------------------------------------------------
+# Action masking helper  (used for sampling AND in the PPO update so the
+# importance ratio is computed on the same distribution actions came from)
+# ---------------------------------------------------------------------------
+
+def masked_policy(policies: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    """Renormalise policies over valid actions. Falls back to uniform-over-valid
+    if the network puts ~zero mass on every valid action."""
+    p = policies.clamp(min=0) * mask
+    s = p.sum(-1, keepdim=True)
+    uniform = mask / mask.sum(-1, keepdim=True).clamp(min=1.0)
+    return torch.where(s > 1e-8, p / s.clamp(min=1e-8), uniform)
+
+
+# ---------------------------------------------------------------------------
 # Worker process  (pure CPU — no CUDA, no network)
 # ---------------------------------------------------------------------------
 
@@ -195,14 +222,20 @@ def env_worker(rank: int, obs_pipe, act_pipe):
     Owns one Flatland env. Protocol:
       Startup  : sends (obs [n_agents, obs_size], valid_tgts [n_agents, A_SIZE])
       Loop     : recvs action dict {agent_id: flatland_action (int)}
-                 sends (obs, rewards, done_dict, valid_tgts)
+                 sends (obs, shaped_rewards, done_dict, valid_tgts, raw_rewards)
       _RESET   : resets env, sends (obs, valid_tgts)
       _SHUTDOWN: exits
     """
-    env    = make_env(seed_offset=rank)
+    env    = make_env(rank)
     n      = Config.n_agents
     obs_sz = Config.obs_size
     _trans_cache: dict = {}   # per-episode rail transition cache (pos,dir) -> transitions
+    # Per-worker seed stream: reproducible, but a different map every episode
+    # and different across workers.
+    seed_rng = np.random.default_rng(Config.seed + rank)
+
+    def next_seed() -> int:
+        return int(seed_rng.integers(0, 2**31 - 1))
 
     def pack_obs(obs_dict):
         arr = np.zeros((n, obs_sz), dtype=np.float32)
@@ -225,8 +258,24 @@ def env_worker(rank: int, obs_pipe, act_pipe):
                 vtgts[i, 3] = 1.0       # agent done/missing
         return vtgts
 
-    obs_dict, _ = env.reset()
+    max_dist = float(Config.width * Config.height)   # cap for unreachable cells (inf)
+
+    def target_distances() -> np.ndarray:
+        """Shortest-path distance (cells) from each agent to its target."""
+        dmap = env.distance_map.get()
+        out  = np.zeros(n, dtype=np.float32)
+        for i, a in enumerate(env.agents):
+            if a.state == TrainState.DONE:
+                continue                                   # arrived -> 0
+            pos = a.position  if a.position  is not None else a.initial_position
+            dr  = a.direction if a.direction is not None else a.initial_direction
+            d   = dmap[i, pos[0], pos[1], dr]
+            out[i] = max_dist if not np.isfinite(d) else min(float(d), max_dist)
+        return out
+
+    obs_dict, _ = env.reset(random_seed=next_seed())
     env._max_episode_steps = Config.max_episode_steps   # override timetable value
+    prev_dist = target_distances()
     obs_pipe.send((pack_obs(obs_dict), compute_valid_tgts(obs_dict)))
 
     while True:
@@ -238,25 +287,27 @@ def env_worker(rank: int, obs_pipe, act_pipe):
         if msg == _RESET:
             _trans_cache.clear()    # rail regenerates — old transitions invalid
             clear_trans_cache()     # also clear shortestpath.py module cache
-            obs_dict, _ = env.reset()
+            obs_dict, _ = env.reset(random_seed=next_seed())
             env._max_episode_steps = Config.max_episode_steps   # override timetable value
+            prev_dist = target_distances()
             obs_pipe.send((pack_obs(obs_dict), compute_valid_tgts(obs_dict)))
             continue
 
-        # Normal env step
-        result   = env.step(msg)
-        obs_dict = result[0]
-        rew_dict = result[1]
-        term     = result[2]
-        trunc    = result[3] if len(result) > 3 else {}
+        # Normal env step. Flatland returns (obs, rewards, dones, info); there is no
+        # separate truncation flag — on timeout Flatland marks every agent done itself.
+        obs_dict, rew_dict, term, _info = env.step(msg)
 
         obs  = pack_obs(obs_dict)
         rews = np.array([rew_dict.get(i, 0.0) for i in range(n)], dtype=np.float32)
 
-        done = {k: term.get(k, False) or trunc.get(k, False) for k in term}
-        done['__all__'] = all(done.get(i, False) for i in range(n))
+        cur_dist  = target_distances()
+        shaped    = rews + SHAPING_COEF * (prev_dist - cur_dist)
+        prev_dist = cur_dist
 
-        obs_pipe.send((obs, rews, done, compute_valid_tgts(obs_dict)))
+        done = {i: bool(term.get(i, False)) for i in range(n)}
+        done['__all__'] = bool(term.get('__all__', False)) or all(done.values())
+
+        obs_pipe.send((obs, shaped.astype(np.float32), done, compute_valid_tgts(obs_dict), rews))
 
 
 # ---------------------------------------------------------------------------
@@ -318,6 +369,11 @@ def ppo_update(network, optimizer, buffer, returns):
     flat_lp_old   = buffer.log_probs.view(T * W, A)
     flat_vals_old = buffer.values.view(T * W)
 
+    # Only agents that actually had a choice (>1 valid action) contribute to the
+    # actor/entropy loss. Done agents and forced moves carry no learning signal.
+    has_choice = (flat_tgts.sum(-1) > 1).float()           # [T*W, A]
+    n_choice   = has_choice.sum().clamp(min=1.0)
+
     adv = flat_returns - flat_vals_old
     if adv.numel() > 1 and adv.std() > 1e-8:
         adv = (adv - adv.mean()) / (adv.std() + 1e-8)
@@ -327,14 +383,17 @@ def ppo_update(network, optimizer, buffer, returns):
         policies, estimations, v = network(flat_obs)
         cur_v = v.squeeze(-1)
 
+        # Same masked distribution the actions were sampled from
+        m_pol  = masked_policy(policies, flat_tgts)
+
         # Actor loss (PPO clip)
-        act_p  = policies.gather(2, flat_acts.unsqueeze(-1)).squeeze(-1)
+        act_p  = m_pol.gather(2, flat_acts.unsqueeze(-1)).squeeze(-1)
         log_p  = torch.log(act_p + 1e-8)
         ratio  = torch.exp(log_p - flat_lp_old)
         adv_e  = adv.unsqueeze(1)
         surr1  = ratio * adv_e
         surr2  = torch.clamp(ratio, 1 - PPO_CLIP, 1 + PPO_CLIP) * adv_e
-        a_loss = -torch.min(surr1, surr2).mean()
+        a_loss = -(torch.min(surr1, surr2) * has_choice).sum() / n_choice
 
         # Critic loss
         std    = flat_returns.std().clamp(min=1e-8)
@@ -342,8 +401,8 @@ def ppo_update(network, optimizer, buffer, returns):
         v_norm = (cur_v        - flat_returns.mean()) / std
         c_loss = F.mse_loss(v_norm, r_norm)
 
-        # Entropy
-        ent    = -(policies * torch.log(policies + 1e-8)).sum(-1).mean()
+        # Entropy over valid actions only (unmasked entropy would push mass onto invalid moves)
+        ent    = (-(m_pol * torch.log(m_pol + 1e-8)).sum(-1) * has_choice).sum() / n_choice
 
         # Estimator (valid-action imitation)
         e_loss = F.binary_cross_entropy_with_logits(estimations, flat_tgts)
@@ -428,6 +487,7 @@ def train():
     )
 
     episode_count = start_episode
+    last_saved_ep = start_episode
     ep_reward_buf = [0.0] * N_WORKERS   # running reward sum per worker, reset each episode
     t_start       = time.time()
     print(f"Training: episodes {start_episode} → {MAX_EPISODES}\n")
@@ -457,47 +517,37 @@ def train():
                 policies, _, v     = network(obs_t)                            # [W, A, act], [W,1]
                 values_t           = v.squeeze(-1)                             # [W]
 
-                # 2. Sample actions with expert valid-action masking (CPU, fast)
-                actions_np    = np.zeros((N_WORKERS, Config.n_agents), dtype=np.int64)
-                actions_dicts = [{} for _ in range(N_WORKERS)]
-
-                policies_cpu = policies.cpu()   # one transfer for all workers
+                # 2. Build the current-state action mask. Done agents (and any row
+                #    with no valid action) are forced to Stop, so they contribute
+                #    log-prob 0 and no gradient.
                 for w in range(N_WORKERS):
                     for i in range(Config.n_agents):
-                        if dones[w].get(i, False):
-                            actions_np[w, i]    = 3
-                            actions_dicts[w][i] = 4   # Flatland stop
-                            continue
-                        probs = policies_cpu[w, i].clone().clamp(min=0)
-                        # Apply expert hard mask
-                        mask  = torch.from_numpy(valid_tgts_np[w, i])
-                        probs = probs * mask
-                        if torch.isnan(probs).any() or probs.sum() <= 0:
-                            probs = mask.clone()
-                            if probs.sum() <= 0:
-                                probs[3] = 1.0   # force stop
-                        probs /= probs.sum()
-                        act = Categorical(probs=probs).sample().item()
-                        actions_np[w, i]    = act
-                        # internal 0=L,1=F,2=R,3=Stop → Flatland 1=L,2=F,3=R,4=Stop
-                        actions_dicts[w][i] = act + 1 if act < 3 else 4
+                        if dones[w].get(i, False) or valid_tgts_np[w, i].sum() <= 0:
+                            valid_tgts_np[w, i] = 0.0
+                            valid_tgts_np[w, i, 3] = 1.0
+                valid_t = torch.from_numpy(valid_tgts_np).to(device)          # [W, A, A_SIZE]
 
-                # 3. Send actions to ALL workers — they start stepping in parallel NOW
+                # 3. Sample from the masked policy and record ITS log-prob
+                m_pol     = masked_policy(torch.nan_to_num(policies), valid_t)
+                actions_t = Categorical(probs=m_pol).sample()                 # [W, A]
+                log_probs = torch.log(m_pol.gather(2, actions_t.unsqueeze(-1)).squeeze(-1) + 1e-8)
+                actions_np = actions_t.cpu().numpy()
+
+                # internal 0=L,1=F,2=R,3=Stop → Flatland 1=L,2=F,3=R,4=Stop
+                actions_dicts = [
+                    {i: int(a) + 1 if a < 3 else 4 for i, a in enumerate(actions_np[w])}
+                    for w in range(N_WORKERS)
+                ]
+
+                # 4. Send actions to ALL workers — they start stepping in parallel NOW
                 for w in range(N_WORKERS):
                     act_pipes[w].send(actions_dicts[w])
 
-                # (Workers are running env.step() on their CPU cores in parallel here)
-
-                # Compute log-probs on GPU while workers are busy
-                actions_t = torch.from_numpy(actions_np).to(device)           # [W, A]
-                act_probs = policies.gather(2, actions_t.unsqueeze(-1)).squeeze(-1)
-                log_probs = torch.log(act_probs + 1e-8)                       # [W, A]
-                valid_t   = torch.from_numpy(valid_tgts_np).to(device)        # current-state mask
-
-                # 4. Collect results — blocks until all 11 workers finish
+                # 5. Collect results — blocks until all workers finish
                 results          = [obs_pipes[w].recv() for w in range(N_WORKERS)]
                 next_obs_np      = np.stack([r[0] for r in results])          # [W, A, obs]
-                rewards_np       = np.stack([r[1] for r in results])          # [W, A]
+                rewards_np       = np.stack([r[1] for r in results])          # [W, A] shaped (for learning)
+                raw_rewards_np   = np.stack([r[4] for r in results])          # [W, A] Flatland reward (for logs)
                 next_dones       = [r[2]            for r in results]
                 valid_tgts_np    = np.stack([r[3] for r in results])          # [W, A, A_SIZE] next-state masks
 
@@ -510,8 +560,13 @@ def train():
                 buffer.store(obs_t, actions_t, rewards_t, dones_t,
                              valid_t, log_probs, values_t)
 
+                # Accumulate rewards BEFORE the done check so each episode's final
+                # step (which carries Flatland's end-of-episode penalty) is counted
+                # in that episode, not the next one.
+                for w in range(N_WORKERS):
+                    ep_reward_buf[w] += float(raw_rewards_np[w].sum())
+
                 # ---- Inline reset + per-episode logging ----
-                # Both loops merged so we only iterate N_WORKERS once.
                 for w in range(N_WORKERS):
                     if next_dones[w]['__all__']:
                         episode_count += 1
@@ -528,10 +583,6 @@ def train():
                         valid_tgts_np[w]  = reset_data[1]
                         next_dones[w]     = {'__all__': False,
                                              **{i: False for i in range(Config.n_agents)}}
-
-                # Accumulate per-worker episode rewards (after reset so done workers start fresh)
-                for w in range(N_WORKERS):
-                    ep_reward_buf[w] += float(rewards_np[w].sum())
 
                 obs_np = next_obs_np
                 dones  = next_dones
@@ -556,7 +607,7 @@ def train():
             ep_reward_str = f"EpReward {sum(rollout_ep_rewards)/len(rollout_ep_rewards):8.2f} (n={len(rollout_ep_rewards)})"
         else:
             # No episode finished this rollout — fall back to per-step mean
-            ep_reward_str = f"Reward/step {buffer.rewards.sum(dim=-1).mean().item():.3f} (no ep done)"
+            ep_reward_str = f"ShapedReward/step {buffer.rewards.sum(dim=-1).mean().item():.3f} (no ep done)"
         print(f"Ep {episode_count:4d}/{MAX_EPISODES} | "
               f"Loss {avg_loss:.4f} | "
               f"{ep_reward_str} | "
@@ -565,13 +616,16 @@ def train():
         # ----------------------------------------------------------------------
         # CHECKPOINT
         # ----------------------------------------------------------------------
-        if episode_count % SAVE_EVERY == 0 and episode_count > start_episode:
+        # Episode count can jump by several per rollout (many workers), so a
+        # `% SAVE_EVERY == 0` test would often be skipped. Track the gap instead.
+        if episode_count - last_saved_ep >= SAVE_EVERY:
             path = os.path.join(ckpt_dir, f"checkpoint_{episode_count}.pth")
             torch.save({
                 "model_state_dict":     network.state_dict(),
                 "optimizer_state_dict": optimizer.state_dict(),
                 "episode":              episode_count,
             }, path)
+            last_saved_ep = episode_count
             print(f"  >> Saved {path}")
 
         # (Workers are reset inline during the rollout — nothing to do here.)

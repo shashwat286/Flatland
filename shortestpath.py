@@ -36,7 +36,7 @@ def get_valid_move_actions_(agent_direction: Grid4TransitionsEnum,
     valid_actions: Set[RailEnvNextAction] = set()
     _key = (agent_position, agent_direction)
     if _key not in _trans_cache:
-        _trans_cache[_key] = rail.get_transitions((agent_position, agent_direction))
+        _trans_cache[_key] = rail.get_transitions(*agent_position, agent_direction)
     possible_transitions = _trans_cache[_key]
     num_transitions = np.count_nonzero(possible_transitions)
 

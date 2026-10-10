@@ -306,7 +306,7 @@ class StateMaskingObs(ObservationBuilder):
         """Cached wrapper around rail.get_transitions."""
         key = (pos, direction)
         if key not in self._rail_trans_cache:
-            self._rail_trans_cache[key] = self.env.rail.get_transitions((pos, direction))
+            self._rail_trans_cache[key] = self.env.rail.get_transitions(*pos, direction)
         return self._rail_trans_cache[key]
 
     def StateComputation(self,agent_pos,agent_dir) :
@@ -391,7 +391,7 @@ class StateMaskingObs(ObservationBuilder):
                 2 ---> forward
                 3 ---> right
         """
-        avb_moves = self.env.rail.get_transitions((my_pos, my_direction))
+        avb_moves = self.env.rail.get_transitions(*my_pos, my_direction)
         action2direction = [[3, 0, 1], [0, 1, 2], [1, 2, 3], [2, 3, 0]]
         dir2grid = np.array([[-1, 0], [0, 1], [1, 0], [0, -1]])
         next_dir_grid = np.array([-1, 0, 1])
@@ -533,7 +533,7 @@ class StateMaskingObs(ObservationBuilder):
     def isJuntion(self, agent_pos):
         trans = []
         for direction in range(0, 4):
-            trans.append(sum(self.env.rail.get_transitions((agent_pos, direction))))
+            trans.append(sum(self.env.rail.get_transitions(*agent_pos, direction)))
         return sum(trans) > 2
 
     def _count_path_block(self, start_pos, heading, agentID, old_pos, old_heading):

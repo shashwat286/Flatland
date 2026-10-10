@@ -28,7 +28,7 @@ def create_notebook():
 
     add_markdown("### 1. Install Dependencies\n")
     add_code(
-        "!pip install flatland-rl\n"
+        "!pip install flatland-rl==4.0.3\n"
         "!pip install torch numpy\n"
         "# After this cell finishes, go to Runtime → Restart runtime, then Run All again"
     )

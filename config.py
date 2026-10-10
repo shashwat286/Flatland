@@ -1,3 +1,4 @@
+import os
 
 class Config:
     # Environment Dimensions
@@ -19,6 +20,8 @@ class Config:
     max_malfunction_duration = 50
     
     # Reward Logic
+    # NOTE: only used by the legacy train_marl.py. Training.py uses Flatland's
+    # built-in rewards, so changing these has no effect there.
     step_penalty = -0.3
     global_reward = 20.0
     
@@ -27,7 +30,10 @@ class Config:
     action_size = 5 # (0: stop, 1: left, 2: straight, 3: right, 4: no-op/logic)
     
     # Training Parameters
-    checkpoint_dir = "/content/drive/MyDrive/Flatland/checkpoints"
+    # Google Drive on Colab, local ./checkpoints everywhere else
+    checkpoint_dir = ("/content/drive/MyDrive/Flatland/checkpoints"
+                      if os.path.isdir("/content/drive")
+                      else os.path.join(os.path.dirname(os.path.abspath(__file__)), "checkpoints"))
     lr = 1e-4
     gamma = 0.99
     batch_size = 64
